@@ -37,6 +37,14 @@ export PWSH_HISTORY_URL="http://history-server-host:37373"
 
 `PWSH_HISTORY_URL` is used by the PowerShell client. If it is not set and the bind address is `0.0.0.0` or `[::]`, the server detects the default-route IP and uses that address when `--lazy` writes the profile.
 
+Configuration is resolved per setting in this order:
+
+```text
+environment variable > existing PowerShell profile value > program default
+```
+
+That means repeated `--lazy` runs reuse the token already written to `$PROFILE.CurrentUserAllHosts` unless `PWSH_HISTORY_TOKEN` is explicitly set in the server process environment.
+
 ## Lazy PowerShell setup
 
 Run the server with `--lazy` on a machine where `pwsh` is installed:

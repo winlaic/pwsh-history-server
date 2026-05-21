@@ -39,6 +39,14 @@ struct Config {
     lazy: bool,
 }
 
+#[derive(Debug, Default)]
+struct ProfileConfig {
+    db_path: Option<String>,
+    token: Option<String>,
+    bind: Option<String>,
+    url: Option<String>,
+}
+
 #[derive(Clone)]
 struct AppState {
     db: SqlitePool,
@@ -141,15 +149,23 @@ impl Config {
             }
         }
 
+        let profile_config = load_profile_config();
         let db_path = optional_env("PWSH_HISTORY_DB")
+            .or(profile_config.db_path)
             .map(Ok)
             .unwrap_or_else(default_db_path)?;
-        let token = optional_env("PWSH_HISTORY_TOKEN").unwrap_or_else(generate_token);
-        let bind = optional_env("PWSH_HISTORY_BIND").unwrap_or_else(|| DEFAULT_BIND.to_string());
+        let token = optional_env("PWSH_HISTORY_TOKEN")
+            .or(profile_config.token)
+            .unwrap_or_else(generate_token);
+        let bind = optional_env("PWSH_HISTORY_BIND")
+            .or(profile_config.bind)
+            .unwrap_or_else(|| DEFAULT_BIND.to_string());
         let addr: SocketAddr = bind
             .parse()
             .with_context(|| format!("invalid PWSH_HISTORY_BIND: {bind}"))?;
-        let url = optional_env("PWSH_HISTORY_URL").unwrap_or_else(|| default_url_for_addr(addr));
+        let url = optional_env("PWSH_HISTORY_URL")
+            .or(profile_config.url)
+            .unwrap_or_else(|| default_url_for_addr(addr));
 
         Ok(Self {
             db_path,
@@ -160,6 +176,80 @@ impl Config {
             lazy,
         })
     }
+}
+
+fn load_profile_config() -> ProfileConfig {
+    let profile_path = current_user_all_hosts_profile()
+        .map(PathBuf::from)
+        .or_else(|| {
+            home_dir()
+                .ok()
+                .map(|home| home.join(".config").join("powershell").join("profile.ps1"))
+        });
+
+    let Some(profile_path) = profile_path else {
+        return ProfileConfig::default();
+    };
+
+    let Ok(content) = fs::read_to_string(profile_path) else {
+        return ProfileConfig::default();
+    };
+
+    parse_profile_config(&content, home_dir().ok().as_deref())
+}
+
+fn parse_profile_config(content: &str, home: Option<&Path>) -> ProfileConfig {
+    let mut config = ProfileConfig::default();
+
+    for line in content.lines() {
+        let Some((name, value)) = parse_profile_env_assignment(line, home) else {
+            continue;
+        };
+
+        match name.as_str() {
+            "PWSH_HISTORY_DB" => config.db_path = Some(value),
+            "PWSH_HISTORY_TOKEN" => config.token = Some(value),
+            "PWSH_HISTORY_BIND" => config.bind = Some(value),
+            "PWSH_HISTORY_URL" => config.url = Some(value),
+            _ => {}
+        }
+    }
+
+    config
+}
+
+fn parse_profile_env_assignment(line: &str, home: Option<&Path>) -> Option<(String, String)> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("$env:PWSH_HISTORY_")?;
+    let (suffix, value) = rest.split_once('=')?;
+    let name = format!("PWSH_HISTORY_{}", suffix.trim());
+    let value = parse_profile_value(value.trim(), home)?;
+    if value.trim().is_empty() {
+        return None;
+    }
+    Some((name, value))
+}
+
+fn parse_profile_value(value: &str, home: Option<&Path>) -> Option<String> {
+    if let Some(value) = parse_ps_single_quoted(value) {
+        return Some(value);
+    }
+
+    let join_path_prefix = "(Join-Path $HOME ";
+    if let Some(rest) = value.strip_prefix(join_path_prefix) {
+        let rest = rest.strip_suffix(')')?.trim();
+        let relative = parse_ps_single_quoted(rest)?;
+        let home = home?;
+        return Some(home.join(relative).to_string_lossy().into_owned());
+    }
+
+    None
+}
+
+fn parse_ps_single_quoted(value: &str) -> Option<String> {
+    let value = value.trim();
+    let inner = value.strip_prefix('\'')?.strip_suffix('\'')?;
+    Some(inner.replace("''", "'"))
 }
 
 fn optional_env(name: &str) -> Option<String> {
@@ -676,8 +766,8 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_BIND, escape_like, managed_profile_block, ps_path_expr_with_home,
-        remove_managed_profile_blocks, update_profile_content,
+        Config, DEFAULT_BIND, escape_like, managed_profile_block, parse_profile_config,
+        ps_path_expr_with_home, remove_managed_profile_blocks, update_profile_content,
     };
     use std::{net::SocketAddr, path::Path};
 
@@ -724,6 +814,38 @@ mod tests {
             ps_path_expr_with_home(Path::new("/opt/pwsh-history.ps1"), Path::new("/home/me")),
             "'/opt/pwsh-history.ps1'"
         );
+    }
+
+    #[test]
+    fn profile_config_reads_existing_managed_values() {
+        let profile = "\
+# >>> pwsh-history-server >>>
+$env:PWSH_HISTORY_DB = (Join-Path $HOME '.local/share/pwsh-history/history.sqlite3')
+$env:PWSH_HISTORY_TOKEN = 'keep-this-token'
+$env:PWSH_HISTORY_URL = 'http://10.0.0.2:37373'
+# <<< pwsh-history-server <<<
+";
+        let config = parse_profile_config(profile, Some(Path::new("/home/me")));
+
+        assert_eq!(
+            config.db_path.as_deref(),
+            Some("/home/me/.local/share/pwsh-history/history.sqlite3")
+        );
+        assert_eq!(config.token.as_deref(), Some("keep-this-token"));
+        assert_eq!(config.url.as_deref(), Some("http://10.0.0.2:37373"));
+        assert_eq!(config.bind, None);
+    }
+
+    #[test]
+    fn profile_config_reads_legacy_bind_and_escaped_quotes() {
+        let profile = "\
+$env:PWSH_HISTORY_TOKEN = 'it''s-token'
+$env:PWSH_HISTORY_BIND = '0.0.0.0:38444'
+";
+        let config = parse_profile_config(profile, Some(Path::new("/home/me")));
+
+        assert_eq!(config.token.as_deref(), Some("it's-token"));
+        assert_eq!(config.bind.as_deref(), Some("0.0.0.0:38444"));
     }
 
     #[test]
