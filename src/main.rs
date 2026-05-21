@@ -376,29 +376,36 @@ fn default_route_ip_with(bind: &str, destination: &str) -> Option<IpAddr> {
 fn print_startup_config(config: &Config) {
     println!(
         "PWSH_HISTORY_DB={} ({})",
-        config.db_path, config.sources.db_path
+        config.db_path,
+        config.sources.db_path.describe("PWSH_HISTORY_DB")
     );
     println!(
         "PWSH_HISTORY_TOKEN={} ({})",
-        config.token, config.sources.token
+        config.token,
+        config.sources.token.describe("PWSH_HISTORY_TOKEN")
     );
     println!(
         "PWSH_HISTORY_BIND={} ({})",
-        config.bind, config.sources.bind
+        config.bind,
+        config.sources.bind.describe("PWSH_HISTORY_BIND")
     );
-    println!("PWSH_HISTORY_URL={} ({})", config.url, config.sources.url);
+    println!(
+        "PWSH_HISTORY_URL={} ({})",
+        config.url,
+        config.sources.url.describe("PWSH_HISTORY_URL")
+    );
     if config.lazy {
         println!("PWSH_HISTORY_LAZY=1");
     }
 }
 
-impl std::fmt::Display for ConfigSource {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ConfigSource {
+    fn describe(self, name: &str) -> String {
         match self {
-            ConfigSource::Env => formatter.write_str("from env"),
-            ConfigSource::Profile => formatter.write_str("from profile"),
-            ConfigSource::Default => formatter.write_str("default"),
-            ConfigSource::Generated => formatter.write_str("generated"),
+            ConfigSource::Env => format!("from env {name}"),
+            ConfigSource::Profile => "from profile $PROFILE.CurrentUserAllHosts".to_string(),
+            ConfigSource::Default => "program default".to_string(),
+            ConfigSource::Generated => "generated new random value".to_string(),
         }
     }
 }
@@ -500,72 +507,65 @@ fn current_user_all_hosts_profile() -> Option<String> {
 }
 
 fn update_profile_content(current: &str, config: &Config, script_path: &Path) -> String {
-    let cleaned = remove_managed_profile_blocks(current);
-    let existing_source = cleaned.lines().position(is_pwsh_history_source_line);
-
-    let mut output = String::new();
-    match existing_source {
-        Some(source_line) => {
-            for (line_index, line) in cleaned.lines().enumerate() {
-                if line_index == source_line {
-                    output.push_str(&managed_profile_block(config, script_path, false));
-                }
-                output.push_str(line);
-                output.push('\n');
-            }
-        }
-        None => {
-            if !cleaned.trim().is_empty() {
-                output.push_str(cleaned.trim_end_matches([' ', '\t', '\r', '\n']));
-                output.push('\n');
-                output.push('\n');
-            }
-            output.push_str(&managed_profile_block(config, script_path, true));
-        }
+    if let Some((start, end)) = managed_profile_block_range(current) {
+        let outside = format!("{}{}", &current[..start], &current[end..]);
+        let include_source = !outside.lines().any(is_pwsh_history_source_line);
+        return format!(
+            "{}{}{}",
+            &current[..start],
+            managed_profile_block(config, script_path, include_source),
+            &current[end..]
+        );
     }
 
+    if let Some(source_start) = find_pwsh_history_source_line_start(current) {
+        return format!(
+            "{}{}{}",
+            &current[..source_start],
+            managed_profile_block(config, script_path, false),
+            &current[source_start..]
+        );
+    }
+
+    let mut output = current.to_string();
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(&managed_profile_block(config, script_path, true));
     output
 }
 
-fn remove_managed_profile_blocks(current: &str) -> String {
-    let mut output = Vec::new();
-    let mut in_block = false;
-    let mut removed_block = false;
+fn managed_profile_block_range(content: &str) -> Option<(usize, usize)> {
+    let start = content.find(PROFILE_BEGIN)?;
+    let end_start = content[start..].find(PROFILE_END)? + start;
+    let mut end = end_start + PROFILE_END.len();
 
-    for line in current.lines() {
-        if line.trim() == PROFILE_BEGIN {
-            in_block = true;
-            removed_block = true;
-            while output
-                .last()
-                .is_some_and(|line: &&str| line.trim().is_empty())
-            {
-                output.pop();
-            }
-            continue;
+    if content[end..].starts_with("\r\n") {
+        end += 2;
+    } else if content[end..].starts_with('\n') {
+        end += 1;
+    }
+
+    Some((start, end))
+}
+
+fn find_pwsh_history_source_line_start(content: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        if is_pwsh_history_source_line(line.trim_end_matches(['\r', '\n'])) {
+            return Some(offset);
         }
+        offset += line.len();
+    }
 
-        if line.trim() == PROFILE_END {
-            in_block = false;
-            continue;
-        }
-
-        if !in_block {
-            output.push(line);
+    if !content.ends_with('\n') {
+        let line_start = content.rfind('\n').map_or(0, |index| index + 1);
+        if is_pwsh_history_source_line(&content[line_start..]) {
+            return Some(line_start);
         }
     }
 
-    if removed_block {
-        while output.first().is_some_and(|line| line.trim().is_empty()) {
-            output.remove(0);
-        }
-    }
-
-    let mut cleaned = output.join("\n");
-    if current.ends_with('\n') && !cleaned.is_empty() {
-        cleaned.push('\n');
-    }
-    cleaned
+    None
 }
 
 fn is_pwsh_history_source_line(line: &str) -> bool {
@@ -854,8 +854,7 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::{
         Config, ConfigSource, ConfigSources, DEFAULT_BIND, escape_like, managed_profile_block,
-        parse_profile_config, ps_path_expr_with_home, remove_managed_profile_blocks,
-        update_profile_content,
+        parse_profile_config, ps_path_expr_with_home, update_profile_content,
     };
     use std::{net::SocketAddr, path::Path};
 
@@ -989,6 +988,37 @@ $env:PWSH_HISTORY_TOKEN = 'old'
     }
 
     #[test]
+    fn profile_update_preserves_user_whitespace_around_managed_block() {
+        let config = test_config();
+        let current = "\
+before
+
+
+# >>> pwsh-history-server >>>
+$env:PWSH_HISTORY_TOKEN = 'old'
+# <<< pwsh-history-server <<<
+
+
+after
+";
+
+        let updated = update_profile_content(
+            current,
+            &config,
+            Path::new("/home/me/.config/powershell/pwsh-history.ps1"),
+        );
+        let twice = update_profile_content(
+            &updated,
+            &config,
+            Path::new("/home/me/.config/powershell/pwsh-history.ps1"),
+        );
+
+        assert_eq!(updated, twice);
+        assert!(updated.contains("before\n\n\n# >>> pwsh-history-server >>>"));
+        assert!(updated.contains("# <<< pwsh-history-server <<<\n\n\nafter"));
+    }
+
+    #[test]
     fn profile_update_places_env_block_before_existing_source() {
         let config = test_config();
         let current = "Write-Host hi\n. '/custom/pwsh-history.ps1'\n";
@@ -1018,18 +1048,6 @@ $env:PWSH_HISTORY_TOKEN = 'old'
 
         assert!(updated.contains("# source pwsh-history.ps1 later"));
         assert!(updated.contains(". '/home/me/.config/powershell/pwsh-history.ps1'"));
-    }
-
-    #[test]
-    fn remove_managed_profile_blocks_keeps_unmanaged_content() {
-        let current = "\
-one
-# >>> pwsh-history-server >>>
-managed
-# <<< pwsh-history-server <<<
-two
-";
-        assert_eq!(remove_managed_profile_blocks(current), "one\ntwo\n");
     }
 
     fn test_config() -> Config {
