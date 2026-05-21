@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -36,7 +36,7 @@ struct Config {
     port: u16,
     addr: SocketAddr,
     url: String,
-    lazy: bool,
+    install: bool,
     sources: ConfigSources,
 }
 
@@ -65,7 +65,7 @@ struct CliArgs {
     db_path: Option<String>,
     port: Option<u16>,
     token: Option<String>,
-    lazy: bool,
+    install: bool,
 }
 
 #[derive(Clone)]
@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
     print_startup_config(&config);
 
-    if config.lazy {
+    if config.install {
         install_lazy_profile(&config)?;
     }
 
@@ -182,7 +182,7 @@ impl Config {
             port,
             addr,
             url,
-            lazy: args.lazy,
+            install: args.install,
             sources: ConfigSources {
                 db_path: db_path_source,
                 token: token_source,
@@ -198,7 +198,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs> {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--lazy" => parsed.lazy = true,
+            "--install" | "--lazy" => parsed.install = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -393,8 +393,12 @@ fn print_startup_config(config: &Config) {
         config.url
     );
     println!(
-        "  lazy install: {}",
-        if config.lazy { "enabled" } else { "disabled" }
+        "  profile install: {}",
+        if config.install {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
 }
 
@@ -415,7 +419,7 @@ fn print_help() {
 pwsh-history-server
 
 Usage:
-  pwsh-history-server [--db PATH] [--port PORT] [--token TOKEN] [--lazy]
+  pwsh-history-server [--db PATH] [--port PORT] [--token TOKEN] [--install]
 
 Server options:
   --db PATH             SQLite database path
@@ -426,7 +430,7 @@ Server options:
                         default: profile token, otherwise generated
 
 Options:
-  --lazy                install pwsh-history.ps1 and update $PROFILE.CurrentUserAllHosts
+  --install             install pwsh-history.ps1 and update $PROFILE.CurrentUserAllHosts
   -h, --help            show this help
 "
     );
@@ -627,6 +631,7 @@ async fn open_database(path: &str) -> Result<SqlitePool> {
         .filename(path)
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(1))
         .foreign_keys(true);
 
     SqlitePoolOptions::new()
@@ -933,14 +938,14 @@ $env:PWSH_HISTORY_BIND = '0.0.0.0:38444'
             "--port=38444".to_string(),
             "--token".to_string(),
             "token".to_string(),
-            "--lazy".to_string(),
+            "--install".to_string(),
         ])
         .unwrap();
 
         assert_eq!(args.db_path.as_deref(), Some("/tmp/history.sqlite3"));
         assert_eq!(args.port, Some(38444));
         assert_eq!(args.token.as_deref(), Some("token"));
-        assert!(args.lazy);
+        assert!(args.install);
     }
 
     #[test]
@@ -1065,7 +1070,7 @@ after
             port: 9999,
             addr: "0.0.0.0:9999".parse::<SocketAddr>().unwrap(),
             url: "http://history-host:9999".to_string(),
-            lazy: true,
+            install: true,
             sources: ConfigSources {
                 db_path: ConfigSource::Arg,
                 token: ConfigSource::Arg,

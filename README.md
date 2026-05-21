@@ -48,10 +48,10 @@ The token is resolved in this order:
 
 ## Lazy PowerShell setup
 
-Run the server with `--lazy` on a machine where `pwsh` is installed:
+Run the server with `--install` on a machine where `pwsh` is installed:
 
 ```sh
-./target/release/pwsh-history-server --lazy
+./target/release/pwsh-history-server --install
 ```
 
 This copies `pwsh-history.ps1` to:
