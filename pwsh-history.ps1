@@ -67,7 +67,7 @@ function Get-PwshHistoryBuffer {
 }
 
 function Set-PwshHistoryBuffer {
-    param([Parameter(Mandatory)][string]$Line)
+    param([AllowEmptyString()][string]$Line = '')
 
     $buffer = Get-PwshHistoryBuffer
     [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $buffer.Line.Length, $Line)
@@ -150,6 +150,12 @@ function Invoke-PwshHistoryPrefixSearch {
     $isCurrentServerMatch = $index -ge 0 -and $index -lt $matches.Count -and $buffer.Line -eq $matches[$index]
 
     if (-not $isCurrentServerMatch) {
+        if ($Direction -eq 'Forward') {
+            Reset-PwshHistorySearchState
+            Invoke-PwshHistoryFallback -Direction $Direction -Key $Key -Arg $Arg
+            return
+        }
+
         $prefix = $buffer.Line.Substring(0, $buffer.Cursor)
         $matches = @(Search-PwshHistoryServer -Prefix $prefix -Limit 100)
 
