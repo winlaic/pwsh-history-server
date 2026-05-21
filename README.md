@@ -51,7 +51,7 @@ This copies `pwsh-history.ps1` to:
 $HOME/.config/powershell/pwsh-history.ps1
 ```
 
-Then it updates `$PROFILE.CurrentUserAllHosts` with a managed block containing the effective `PWSH_HISTORY_DB`, `PWSH_HISTORY_TOKEN`, `PWSH_HISTORY_BIND`, and `PWSH_HISTORY_URL` values before sourcing `pwsh-history.ps1`. If you start with environment variables set, those values are written to the profile. If the managed block already exists, it is replaced.
+Then it updates `$PROFILE.CurrentUserAllHosts` with a managed block containing the effective client settings before sourcing `pwsh-history.ps1`. The block writes `PWSH_HISTORY_DB`, `PWSH_HISTORY_TOKEN`, and `PWSH_HISTORY_URL`; it does not write server-only settings such as `PWSH_HISTORY_BIND`. Paths under the home directory are written through `$HOME` instead of hard-coded absolute home paths. If the managed block already exists, it is replaced.
 
 ## HTTP API
 

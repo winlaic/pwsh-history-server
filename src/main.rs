@@ -405,30 +405,43 @@ fn managed_profile_block(config: &Config, script_path: &Path, include_source: bo
     block.push_str(PROFILE_BEGIN);
     block.push('\n');
     block.push_str(&format!(
-        "$env:PWSH_HISTORY_DB = '{}'\n",
-        ps_single_quote(&config.db_path)
+        "$env:PWSH_HISTORY_DB = {}\n",
+        ps_path_expr(Path::new(&config.db_path))
     ));
     block.push_str(&format!(
         "$env:PWSH_HISTORY_TOKEN = '{}'\n",
         ps_single_quote(&config.token)
     ));
     block.push_str(&format!(
-        "$env:PWSH_HISTORY_BIND = '{}'\n",
-        ps_single_quote(&config.bind)
-    ));
-    block.push_str(&format!(
         "$env:PWSH_HISTORY_URL = '{}'\n",
         ps_single_quote(&config.url)
     ));
     if include_source {
-        block.push_str(&format!(
-            ". '{}'\n",
-            ps_single_quote(&script_path.to_string_lossy())
-        ));
+        block.push_str(&format!(". {}\n", ps_path_expr(script_path)));
     }
     block.push_str(PROFILE_END);
     block.push('\n');
     block
+}
+
+fn ps_path_expr(path: &Path) -> String {
+    if let Ok(home) = env::var("HOME") {
+        return ps_path_expr_with_home(path, Path::new(&home));
+    }
+    format!("'{}'", ps_single_quote(&path.to_string_lossy()))
+}
+
+fn ps_path_expr_with_home(path: &Path, home: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(home) {
+        let relative = relative
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if !relative.is_empty() {
+            return format!("(Join-Path $HOME '{}')", ps_single_quote(&relative));
+        }
+    }
+
+    format!("'{}'", ps_single_quote(&path.to_string_lossy()))
 }
 
 fn ps_single_quote(value: &str) -> String {
@@ -663,8 +676,8 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_BIND, escape_like, managed_profile_block, remove_managed_profile_blocks,
-        update_profile_content,
+        Config, DEFAULT_BIND, escape_like, managed_profile_block, ps_path_expr_with_home,
+        remove_managed_profile_blocks, update_profile_content,
     };
     use std::{net::SocketAddr, path::Path};
 
@@ -694,8 +707,23 @@ mod tests {
         assert!(token_index < source_index);
         assert!(block.contains("$env:PWSH_HISTORY_DB = '/tmp/env.sqlite3'"));
         assert!(block.contains("$env:PWSH_HISTORY_TOKEN = 'env-token'"));
-        assert!(block.contains("$env:PWSH_HISTORY_BIND = '1.2.3.4:9999'"));
+        assert!(!block.contains("PWSH_HISTORY_BIND"));
         assert!(block.contains("$env:PWSH_HISTORY_URL = 'http://history-host:9999'"));
+    }
+
+    #[test]
+    fn powershell_path_expression_prefers_home_relative_paths() {
+        assert_eq!(
+            ps_path_expr_with_home(
+                Path::new("/home/me/.config/powershell/pwsh-history.ps1"),
+                Path::new("/home/me"),
+            ),
+            "(Join-Path $HOME '.config/powershell/pwsh-history.ps1')"
+        );
+        assert_eq!(
+            ps_path_expr_with_home(Path::new("/opt/pwsh-history.ps1"), Path::new("/home/me")),
+            "'/opt/pwsh-history.ps1'"
+        );
     }
 
     #[test]
