@@ -506,7 +506,7 @@ async fn add_history(
     }
 
     let now = now_millis()?;
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         INSERT INTO history(command, first_seen_at, last_seen_at, use_count)
         VALUES (?1, ?2, ?2, 1)
@@ -520,6 +520,12 @@ async fn add_history(
     .execute(&state.db)
     .await
     .map_err(ApiError::internal)?;
+
+    info!(
+        command_len = command.len(),
+        rows_affected = result.rows_affected(),
+        "history add"
+    );
 
     Ok((StatusCode::OK, Json(AddHistoryResponse { ok: true })))
 }
@@ -548,6 +554,13 @@ async fn search_history(
     .fetch_all(&state.db)
     .await
     .map_err(ApiError::internal)?;
+
+    info!(
+        prefix = %query.prefix,
+        limit,
+        hits = entries.len(),
+        "history search"
+    );
 
     Ok((StatusCode::OK, Json(SearchResponse { entries })))
 }

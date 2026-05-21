@@ -82,7 +82,7 @@ function Reset-PwshHistorySearchState {
 
 function Search-PwshHistoryServer {
     param(
-        [Parameter(Mandatory)][string]$Prefix,
+        [AllowEmptyString()][string]$Prefix = '',
         [int]$Limit = 100
     )
 
