@@ -37,6 +37,23 @@ struct Config {
     addr: SocketAddr,
     url: String,
     lazy: bool,
+    sources: ConfigSources,
+}
+
+#[derive(Debug)]
+struct ConfigSources {
+    db_path: ConfigSource,
+    token: ConfigSource,
+    bind: ConfigSource,
+    url: ConfigSource,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConfigSource {
+    Env,
+    Profile,
+    Default,
+    Generated,
 }
 
 #[derive(Debug, Default)]
@@ -150,22 +167,33 @@ impl Config {
         }
 
         let profile_config = load_profile_config();
-        let db_path = optional_env("PWSH_HISTORY_DB")
-            .or(profile_config.db_path)
-            .map(Ok)
-            .unwrap_or_else(default_db_path)?;
-        let token = optional_env("PWSH_HISTORY_TOKEN")
-            .or(profile_config.token)
-            .unwrap_or_else(generate_token);
-        let bind = optional_env("PWSH_HISTORY_BIND")
-            .or(profile_config.bind)
-            .unwrap_or_else(|| DEFAULT_BIND.to_string());
+        let (db_path, db_path_source) = resolve_config_value(
+            optional_env("PWSH_HISTORY_DB"),
+            profile_config.db_path,
+            default_db_path,
+            ConfigSource::Default,
+        )?;
+        let (token, token_source) = resolve_config_value(
+            optional_env("PWSH_HISTORY_TOKEN"),
+            profile_config.token,
+            || Ok(generate_token()),
+            ConfigSource::Generated,
+        )?;
+        let (bind, bind_source) = resolve_config_value(
+            optional_env("PWSH_HISTORY_BIND"),
+            profile_config.bind,
+            || Ok(DEFAULT_BIND.to_string()),
+            ConfigSource::Default,
+        )?;
         let addr: SocketAddr = bind
             .parse()
             .with_context(|| format!("invalid PWSH_HISTORY_BIND: {bind}"))?;
-        let url = optional_env("PWSH_HISTORY_URL")
-            .or(profile_config.url)
-            .unwrap_or_else(|| default_url_for_addr(addr));
+        let (url, url_source) = resolve_config_value(
+            optional_env("PWSH_HISTORY_URL"),
+            profile_config.url,
+            || Ok(default_url_for_addr(addr)),
+            ConfigSource::Default,
+        )?;
 
         Ok(Self {
             db_path,
@@ -174,8 +202,31 @@ impl Config {
             addr,
             url,
             lazy,
+            sources: ConfigSources {
+                db_path: db_path_source,
+                token: token_source,
+                bind: bind_source,
+                url: url_source,
+            },
         })
     }
+}
+
+fn resolve_config_value(
+    env_value: Option<String>,
+    profile_value: Option<String>,
+    default: impl FnOnce() -> Result<String>,
+    default_source: ConfigSource,
+) -> Result<(String, ConfigSource)> {
+    if let Some(value) = env_value {
+        return Ok((value, ConfigSource::Env));
+    }
+
+    if let Some(value) = profile_value {
+        return Ok((value, ConfigSource::Profile));
+    }
+
+    Ok((default()?, default_source))
 }
 
 fn load_profile_config() -> ProfileConfig {
@@ -323,12 +374,32 @@ fn default_route_ip_with(bind: &str, destination: &str) -> Option<IpAddr> {
 }
 
 fn print_startup_config(config: &Config) {
-    println!("PWSH_HISTORY_DB={}", config.db_path);
-    println!("PWSH_HISTORY_TOKEN={}", config.token);
-    println!("PWSH_HISTORY_BIND={}", config.bind);
-    println!("PWSH_HISTORY_URL={}", config.url);
+    println!(
+        "PWSH_HISTORY_DB={} ({})",
+        config.db_path, config.sources.db_path
+    );
+    println!(
+        "PWSH_HISTORY_TOKEN={} ({})",
+        config.token, config.sources.token
+    );
+    println!(
+        "PWSH_HISTORY_BIND={} ({})",
+        config.bind, config.sources.bind
+    );
+    println!("PWSH_HISTORY_URL={} ({})", config.url, config.sources.url);
     if config.lazy {
         println!("PWSH_HISTORY_LAZY=1");
+    }
+}
+
+impl std::fmt::Display for ConfigSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigSource::Env => formatter.write_str("from env"),
+            ConfigSource::Profile => formatter.write_str("from profile"),
+            ConfigSource::Default => formatter.write_str("default"),
+            ConfigSource::Generated => formatter.write_str("generated"),
+        }
     }
 }
 
@@ -363,7 +434,7 @@ fn install_lazy_profile(config: &Config) -> Result<()> {
     })?;
 
     let script_path = powershell_dir.join("pwsh-history.ps1");
-    write_file_if_changed(&script_path, PWSH_HISTORY_SCRIPT)
+    write_file(&script_path, PWSH_HISTORY_SCRIPT)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
 
     let profile_path = current_user_all_hosts_profile().unwrap_or_else(|| {
@@ -400,6 +471,10 @@ fn write_file_if_changed(path: &Path, content: &str) -> Result<()> {
         return Ok(());
     }
 
+    write_file(path, content)
+}
+
+fn write_file(path: &Path, content: &str) -> Result<()> {
     let mut file = fs::File::create(path)?;
     file.write_all(content.as_bytes())?;
     Ok(())
@@ -441,10 +516,8 @@ fn update_profile_content(current: &str, config: &Config, script_path: &Path) ->
         }
         None => {
             if !cleaned.trim().is_empty() {
-                output.push_str(&cleaned);
-                if !cleaned.ends_with('\n') {
-                    output.push('\n');
-                }
+                output.push_str(cleaned.trim_end_matches([' ', '\t', '\r', '\n']));
+                output.push('\n');
                 output.push('\n');
             }
             output.push_str(&managed_profile_block(config, script_path, true));
@@ -457,10 +530,18 @@ fn update_profile_content(current: &str, config: &Config, script_path: &Path) ->
 fn remove_managed_profile_blocks(current: &str) -> String {
     let mut output = Vec::new();
     let mut in_block = false;
+    let mut removed_block = false;
 
     for line in current.lines() {
         if line.trim() == PROFILE_BEGIN {
             in_block = true;
+            removed_block = true;
+            while output
+                .last()
+                .is_some_and(|line: &&str| line.trim().is_empty())
+            {
+                output.pop();
+            }
             continue;
         }
 
@@ -471,6 +552,12 @@ fn remove_managed_profile_blocks(current: &str) -> String {
 
         if !in_block {
             output.push(line);
+        }
+    }
+
+    if removed_block {
+        while output.first().is_some_and(|line| line.trim().is_empty()) {
+            output.remove(0);
         }
     }
 
@@ -766,8 +853,9 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_BIND, escape_like, managed_profile_block, parse_profile_config,
-        ps_path_expr_with_home, remove_managed_profile_blocks, update_profile_content,
+        Config, ConfigSource, ConfigSources, DEFAULT_BIND, escape_like, managed_profile_block,
+        parse_profile_config, ps_path_expr_with_home, remove_managed_profile_blocks,
+        update_profile_content,
     };
     use std::{net::SocketAddr, path::Path};
 
@@ -874,6 +962,33 @@ after
     }
 
     #[test]
+    fn profile_update_is_stable_without_growing_blank_lines() {
+        let config = test_config();
+        let current = "\
+before
+
+# >>> pwsh-history-server >>>
+$env:PWSH_HISTORY_TOKEN = 'old'
+# <<< pwsh-history-server <<<
+";
+
+        let once = update_profile_content(
+            current,
+            &config,
+            Path::new("/home/me/.config/powershell/pwsh-history.ps1"),
+        );
+        let twice = update_profile_content(
+            &once,
+            &config,
+            Path::new("/home/me/.config/powershell/pwsh-history.ps1"),
+        );
+
+        assert_eq!(once, twice);
+        assert!(!once.contains("before\n\n\n# >>> pwsh-history-server >>>"));
+        assert!(once.contains("before\n\n# >>> pwsh-history-server >>>"));
+    }
+
+    #[test]
     fn profile_update_places_env_block_before_existing_source() {
         let config = test_config();
         let current = "Write-Host hi\n. '/custom/pwsh-history.ps1'\n";
@@ -925,6 +1040,12 @@ two
             addr: "1.2.3.4:9999".parse::<SocketAddr>().unwrap(),
             url: "http://history-host:9999".to_string(),
             lazy: true,
+            sources: ConfigSources {
+                db_path: ConfigSource::Env,
+                token: ConfigSource::Env,
+                bind: ConfigSource::Env,
+                url: ConfigSource::Env,
+            },
         }
     }
 }
