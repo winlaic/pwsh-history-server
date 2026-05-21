@@ -4,24 +4,54 @@ Centralized PowerShell history storage for Linux `pwsh` sessions that share a ho
 
 The server is a small Rust HTTP service backed by SQLite. Each PowerShell process records and searches history through the server instead of racing on the same PSReadLine history file.
 
-## Server
-
-Set the three required environment variables:
-
-```sh
-export PWSH_HISTORY_DB="$HOME/.local/share/pwsh-history/history.sqlite3"
-export PWSH_HISTORY_TOKEN="change-this-long-random-token"
-export PWSH_HISTORY_BIND="0.0.0.0:37373"
-```
+## Quick start
 
 Build and run:
 
 ```sh
 cargo build --release
-cargo run --release
+./target/release/pwsh-history-server
+```
+
+Without environment variables, the server uses:
+
+```text
+PWSH_HISTORY_DB=$HOME/.local/share/pwsh-history/history.sqlite3
+PWSH_HISTORY_TOKEN=<random 32-byte hex token printed at startup>
+PWSH_HISTORY_BIND=0.0.0.0:37373
+PWSH_HISTORY_URL=http://<default-route-ip>:37373
 ```
 
 The server creates the SQLite parent directory automatically and enables WAL mode.
+
+## Configuration
+
+Environment variables override the defaults:
+
+```sh
+export PWSH_HISTORY_DB="$HOME/.local/share/pwsh-history/history.sqlite3"
+export PWSH_HISTORY_TOKEN="change-this-long-random-token"
+export PWSH_HISTORY_BIND="0.0.0.0:37373"
+export PWSH_HISTORY_URL="http://history-server-host:37373"
+```
+
+`PWSH_HISTORY_URL` is used by the PowerShell client. If it is not set and the bind address is `0.0.0.0` or `[::]`, the server detects the default-route IP and uses that address when `--lazy` writes the profile.
+
+## Lazy PowerShell setup
+
+Run the server with `--lazy` on a machine where `pwsh` is installed:
+
+```sh
+./target/release/pwsh-history-server --lazy
+```
+
+This copies `pwsh-history.ps1` to:
+
+```text
+$HOME/.config/powershell/pwsh-history.ps1
+```
+
+Then it updates `$PROFILE.CurrentUserAllHosts` with a managed block containing the effective `PWSH_HISTORY_DB`, `PWSH_HISTORY_TOKEN`, `PWSH_HISTORY_BIND`, and `PWSH_HISTORY_URL` values before sourcing `pwsh-history.ps1`. If you start with environment variables set, those values are written to the profile. If the managed block already exists, it is replaced.
 
 ## HTTP API
 
