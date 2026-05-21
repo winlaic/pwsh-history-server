@@ -117,6 +117,7 @@ The script configures these PSReadLine behaviors:
 
 - `UpArrow` searches server history backward by the current prefix.
 - `DownArrow` moves forward through the server search results and then restores the typed prefix.
+- Inline prediction uses the history server as a PSReadLine predictor, so the gray suggestion text can be accepted with `RightArrow`.
 - `AddToHistoryHandler` sends accepted commands to the server.
 - PSReadLine file saving is set to `SaveNothing` to avoid the shared-home history-file race.
 - If the server is down or the token is missing, add failures are ignored and arrow search falls back to PSReadLine local history.

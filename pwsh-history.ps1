@@ -19,6 +19,14 @@ if ($env:PWSH_HISTORY_TIMEOUT_SEC) {
     }
 }
 
+$script:PwshHistoryPredictionTimeoutMs = 250
+if ($env:PWSH_HISTORY_PREDICTION_TIMEOUT_MS) {
+    $parsedPredictionTimeout = 0
+    if ([int]::TryParse($env:PWSH_HISTORY_PREDICTION_TIMEOUT_MS, [ref]$parsedPredictionTimeout) -and $parsedPredictionTimeout -gt 0) {
+        $script:PwshHistoryPredictionTimeoutMs = $parsedPredictionTimeout
+    }
+}
+
 $script:PwshHistorySearchState = @{
     Prefix  = $null
     Matches = @()
@@ -132,6 +140,145 @@ function Add-PwshHistoryServer {
     }
 }
 
+function Register-PwshHistoryPredictor {
+    if ([string]::IsNullOrWhiteSpace($script:PwshHistoryToken)) {
+        return
+    }
+
+    if (-not ('PwshHistoryServerPredictor' -as [type])) {
+        $predictorSource = @'
+using System;
+using System.Collections.Generic;
+using System.Net.Http;
+using System.Text.Json;
+using System.Threading;
+using System.Management.Automation.Subsystem;
+using System.Management.Automation.Subsystem.Prediction;
+
+public sealed class PwshHistoryServerPredictor : ICommandPredictor
+{
+    public static readonly Guid PredictorId = new Guid("c56c3b61-4d55-4e9c-8a47-375ac5d42f21");
+    private static readonly HttpClient Client = new HttpClient();
+    private readonly string baseUrl;
+    private readonly string token;
+    private readonly int timeoutMs;
+
+    public PwshHistoryServerPredictor(string baseUrl, string token, int timeoutMs)
+    {
+        this.baseUrl = (baseUrl ?? "").TrimEnd('/');
+        this.token = token ?? "";
+        this.timeoutMs = timeoutMs <= 0 ? 250 : timeoutMs;
+    }
+
+    public Guid Id { get { return PredictorId; } }
+    public string Name { get { return "pwsh-history-server"; } }
+    public string Description { get { return "Predicts commands from pwsh-history-server."; } }
+    public Dictionary<string, string> FunctionsToDefine { get { return new Dictionary<string, string>(); } }
+
+    public SuggestionPackage GetSuggestion(PredictionClient client, PredictionContext context, CancellationToken cancellationToken)
+    {
+        var suggestions = new List<PredictiveSuggestion>();
+        try
+        {
+            if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(token))
+            {
+                return new SuggestionPackage(suggestions);
+            }
+
+            string input = context == null || context.InputAst == null || context.InputAst.Extent == null
+                ? ""
+                : context.InputAst.Extent.Text ?? "";
+            int lastNewline = input.LastIndexOf('\n');
+            if (lastNewline >= 0)
+            {
+                input = input.Substring(lastNewline + 1);
+            }
+
+            string uri = baseUrl + "/v1/history/search?prefix=" + Uri.EscapeDataString(input) + "&limit=1";
+            using (var request = new HttpRequestMessage(HttpMethod.Get, uri))
+            {
+                request.Headers.TryAddWithoutValidation("X-Pwsh-History-Token", token);
+                using (var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+                {
+                    cts.CancelAfter(timeoutMs);
+                    using (var response = Client.SendAsync(request, cts.Token).GetAwaiter().GetResult())
+                    {
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            return new SuggestionPackage(suggestions);
+                        }
+
+                        string json = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                        using (var document = JsonDocument.Parse(json))
+                        {
+                            JsonElement entries;
+                            if (!document.RootElement.TryGetProperty("entries", out entries) || entries.ValueKind != JsonValueKind.Array)
+                            {
+                                return new SuggestionPackage(suggestions);
+                            }
+
+                            foreach (JsonElement entry in entries.EnumerateArray())
+                            {
+                                JsonElement commandElement;
+                                if (entry.TryGetProperty("command", out commandElement))
+                                {
+                                    string command = commandElement.GetString();
+                                    if (!string.IsNullOrWhiteSpace(command) && !string.Equals(command, input, StringComparison.Ordinal))
+                                    {
+                                        suggestions.Add(new PredictiveSuggestion(command));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return new SuggestionPackage(suggestions);
+    }
+
+    public bool CanAcceptFeedback(PredictionClient client, PredictorFeedbackKind feedback) { return false; }
+    public void OnSuggestionDisplayed(PredictionClient client, uint session, int countOrIndex) { }
+    public void OnSuggestionAccepted(PredictionClient client, uint session, string acceptedSuggestion) { }
+    public void OnCommandLineAccepted(PredictionClient client, IReadOnlyList<string> history) { }
+    public void OnCommandLineExecuted(PredictionClient client, string commandLine, bool success) { }
+}
+'@
+        try {
+            Add-Type -TypeDefinition $predictorSource -ErrorAction Stop
+        } catch {
+            return
+        }
+    }
+
+    try {
+        [System.Management.Automation.Subsystem.SubsystemManager]::UnregisterSubsystem(
+            [System.Management.Automation.Subsystem.SubsystemKind]::CommandPredictor,
+            [PwshHistoryServerPredictor]::PredictorId
+        )
+    } catch {
+    }
+
+    try {
+        $predictor = [PwshHistoryServerPredictor]::new(
+            $script:PwshHistoryServerUrl,
+            $script:PwshHistoryToken,
+            $script:PwshHistoryPredictionTimeoutMs
+        )
+        [System.Management.Automation.Subsystem.SubsystemManager]::RegisterSubsystem(
+            [System.Management.Automation.Subsystem.SubsystemKind]::CommandPredictor,
+            $predictor
+        )
+        Set-PSReadLineOption -PredictionSource HistoryAndPlugin -PredictionViewStyle InlineView
+    } catch {
+    }
+}
+
 function Invoke-PwshHistoryPrefixSearch {
     param(
         [Parameter(Mandatory)]
@@ -201,6 +348,8 @@ try {
     Set-PSReadLineOption -HistorySaveStyle SaveNothing
 } catch {
 }
+
+Register-PwshHistoryPredictor
 
 Set-PSReadLineOption -AddToHistoryHandler {
     param([string]$line)
