@@ -24,7 +24,7 @@ use sqlx::{
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-const DEFAULT_BIND: &str = "0.0.0.0:37373";
+const DEFAULT_PORT: u16 = 37373;
 const PROFILE_BEGIN: &str = "# >>> pwsh-history-server >>>";
 const PROFILE_END: &str = "# <<< pwsh-history-server <<<";
 const PWSH_HISTORY_SCRIPT: &str = include_str!("../pwsh-history.ps1");
@@ -33,7 +33,7 @@ const PWSH_HISTORY_SCRIPT: &str = include_str!("../pwsh-history.ps1");
 struct Config {
     db_path: String,
     token: String,
-    bind: String,
+    port: u16,
     addr: SocketAddr,
     url: String,
     lazy: bool,
@@ -44,13 +44,12 @@ struct Config {
 struct ConfigSources {
     db_path: ConfigSource,
     token: ConfigSource,
-    bind: ConfigSource,
-    url: ConfigSource,
+    port: ConfigSource,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ConfigSource {
-    Env,
+    Arg,
     Profile,
     Default,
     Generated,
@@ -58,10 +57,15 @@ enum ConfigSource {
 
 #[derive(Debug, Default)]
 struct ProfileConfig {
-    db_path: Option<String>,
     token: Option<String>,
-    bind: Option<String>,
-    url: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CliArgs {
+    db_path: Option<String>,
+    port: Option<u16>,
+    token: Option<String>,
+    lazy: bool,
 }
 
 #[derive(Clone)]
@@ -154,72 +158,104 @@ async fn main() -> Result<()> {
 
 impl Config {
     fn from_env_and_args() -> Result<Self> {
-        let mut lazy = false;
-        for arg in env::args().skip(1) {
-            match arg.as_str() {
-                "--lazy" => lazy = true,
-                "-h" | "--help" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                _ => bail!("unknown argument: {arg}"),
-            }
-        }
-
+        let args = parse_args(env::args().skip(1))?;
         let profile_config = load_profile_config();
-        let (db_path, db_path_source) = resolve_config_value(
-            optional_env("PWSH_HISTORY_DB"),
-            profile_config.db_path,
-            default_db_path,
-            ConfigSource::Default,
-        )?;
+        let (db_path, db_path_source) =
+            resolve_config_value(args.db_path, None, default_db_path, ConfigSource::Default)?;
         let (token, token_source) = resolve_config_value(
-            optional_env("PWSH_HISTORY_TOKEN"),
+            args.token,
             profile_config.token,
             || Ok(generate_token()),
             ConfigSource::Generated,
         )?;
-        let (bind, bind_source) = resolve_config_value(
-            optional_env("PWSH_HISTORY_BIND"),
-            profile_config.bind,
-            || Ok(DEFAULT_BIND.to_string()),
-            ConfigSource::Default,
-        )?;
+        let (port, port_source) =
+            resolve_config_value(args.port, None, || Ok(DEFAULT_PORT), ConfigSource::Default)?;
+        let bind = format!("0.0.0.0:{port}");
         let addr: SocketAddr = bind
             .parse()
-            .with_context(|| format!("invalid PWSH_HISTORY_BIND: {bind}"))?;
-        let (url, url_source) = resolve_config_value(
-            optional_env("PWSH_HISTORY_URL"),
-            profile_config.url,
-            || Ok(default_url_for_addr(addr)),
-            ConfigSource::Default,
-        )?;
+            .with_context(|| format!("invalid bind address derived from --port: {bind}"))?;
+        let url = default_route_url(port);
 
         Ok(Self {
             db_path,
             token,
-            bind,
+            port,
             addr,
             url,
-            lazy,
+            lazy: args.lazy,
             sources: ConfigSources {
                 db_path: db_path_source,
                 token: token_source,
-                bind: bind_source,
-                url: url_source,
+                port: port_source,
             },
         })
     }
 }
 
-fn resolve_config_value(
-    env_value: Option<String>,
-    profile_value: Option<String>,
-    default: impl FnOnce() -> Result<String>,
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<CliArgs> {
+    let mut parsed = CliArgs::default();
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--lazy" => parsed.lazy = true,
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "--db" => parsed.db_path = Some(required_arg_value("--db", args.next())?),
+            "--port" => {
+                parsed.port = Some(parse_port(&required_arg_value("--port", args.next())?)?)
+            }
+            "--token" => parsed.token = Some(required_arg_value("--token", args.next())?),
+            _ if arg.starts_with("--db=") => {
+                parsed.db_path = Some(non_empty_arg_value("--db", &arg["--db=".len()..])?)
+            }
+            _ if arg.starts_with("--port=") => {
+                parsed.port = Some(parse_port(&arg["--port=".len()..])?)
+            }
+            _ if arg.starts_with("--token=") => {
+                parsed.token = Some(non_empty_arg_value("--token", &arg["--token=".len()..])?)
+            }
+            _ => bail!("unknown argument: {arg}"),
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn required_arg_value(name: &str, value: Option<String>) -> Result<String> {
+    let value = value.with_context(|| format!("{name} requires a value"))?;
+    non_empty_arg_value(name, &value)
+}
+
+fn non_empty_arg_value(name: &str, value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("{name} cannot be empty");
+    }
+    Ok(value.to_string())
+}
+
+fn parse_port(value: &str) -> Result<u16> {
+    let port: u16 = value
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid --port value: {value}"))?;
+    if port == 0 {
+        bail!("--port must be between 1 and 65535");
+    }
+    Ok(port)
+}
+
+fn resolve_config_value<T>(
+    arg_value: Option<T>,
+    profile_value: Option<T>,
+    default: impl FnOnce() -> Result<T>,
     default_source: ConfigSource,
-) -> Result<(String, ConfigSource)> {
-    if let Some(value) = env_value {
-        return Ok((value, ConfigSource::Env));
+) -> Result<(T, ConfigSource)> {
+    if let Some(value) = arg_value {
+        return Ok((value, ConfigSource::Arg));
     }
 
     if let Some(value) = profile_value {
@@ -246,68 +282,37 @@ fn load_profile_config() -> ProfileConfig {
         return ProfileConfig::default();
     };
 
-    parse_profile_config(&content, home_dir().ok().as_deref())
+    parse_profile_config(&content)
 }
 
-fn parse_profile_config(content: &str, home: Option<&Path>) -> ProfileConfig {
+fn parse_profile_config(content: &str) -> ProfileConfig {
     let mut config = ProfileConfig::default();
 
     for line in content.lines() {
-        let Some((name, value)) = parse_profile_env_assignment(line, home) else {
+        let Some(value) = parse_profile_token_assignment(line) else {
             continue;
         };
-
-        match name.as_str() {
-            "PWSH_HISTORY_DB" => config.db_path = Some(value),
-            "PWSH_HISTORY_TOKEN" => config.token = Some(value),
-            "PWSH_HISTORY_BIND" => config.bind = Some(value),
-            "PWSH_HISTORY_URL" => config.url = Some(value),
-            _ => {}
-        }
+        config.token = Some(value);
     }
 
     config
 }
 
-fn parse_profile_env_assignment(line: &str, home: Option<&Path>) -> Option<(String, String)> {
+fn parse_profile_token_assignment(line: &str) -> Option<String> {
     let trimmed = line.trim();
-    let rest = trimmed.strip_prefix("$env:PWSH_HISTORY_")?;
-    let (suffix, value) = rest.split_once('=')?;
-    let name = format!("PWSH_HISTORY_{}", suffix.trim());
-    let value = parse_profile_value(value.trim(), home)?;
+    let value = trimmed.strip_prefix("$env:PWSH_HISTORY_TOKEN")?;
+    let (_, value) = value.split_once('=')?;
+    let value = parse_ps_single_quoted(value.trim())?;
     if value.trim().is_empty() {
         return None;
     }
-    Some((name, value))
-}
-
-fn parse_profile_value(value: &str, home: Option<&Path>) -> Option<String> {
-    if let Some(value) = parse_ps_single_quoted(value) {
-        return Some(value);
-    }
-
-    let join_path_prefix = "(Join-Path $HOME ";
-    if let Some(rest) = value.strip_prefix(join_path_prefix) {
-        let rest = rest.strip_suffix(')')?.trim();
-        let relative = parse_ps_single_quoted(rest)?;
-        let home = home?;
-        return Some(home.join(relative).to_string_lossy().into_owned());
-    }
-
-    None
+    Some(value)
 }
 
 fn parse_ps_single_quoted(value: &str) -> Option<String> {
     let value = value.trim();
     let inner = value.strip_prefix('\'')?.strip_suffix('\'')?;
     Some(inner.replace("''", "'"))
-}
-
-fn optional_env(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 fn default_db_path() -> Result<String> {
@@ -344,16 +349,6 @@ fn hex_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-fn default_url_for_addr(addr: SocketAddr) -> String {
-    let port = addr.port();
-    match addr.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => default_route_url(port),
-        IpAddr::V6(ip) if ip.is_unspecified() => default_route_url(port),
-        IpAddr::V6(ip) => format!("http://[{ip}]:{port}"),
-        ip => format!("http://{ip}:{port}"),
-    }
-}
-
 fn default_route_url(port: u16) -> String {
     match default_route_ip() {
         Some(IpAddr::V6(ip)) => format!("http://[{ip}]:{port}"),
@@ -374,35 +369,39 @@ fn default_route_ip_with(bind: &str, destination: &str) -> Option<IpAddr> {
 }
 
 fn print_startup_config(config: &Config) {
+    println!("server:");
     println!(
-        "PWSH_HISTORY_DB={} ({})",
+        "  db: {} ({})",
         config.db_path,
-        config.sources.db_path.describe("PWSH_HISTORY_DB")
+        config.sources.db_path.describe("--db")
+    );
+    println!("  bind: {} (fixed)", config.addr);
+    println!(
+        "  port: {} ({})",
+        config.port,
+        config.sources.port.describe("--port")
     );
     println!(
-        "PWSH_HISTORY_TOKEN={} ({})",
+        "  token: {} ({})",
         config.token,
-        config.sources.token.describe("PWSH_HISTORY_TOKEN")
+        config.sources.token.describe("--token")
+    );
+    println!();
+    println!("client:");
+    println!(
+        "  url: {} (derived from current server IP and port)",
+        config.url
     );
     println!(
-        "PWSH_HISTORY_BIND={} ({})",
-        config.bind,
-        config.sources.bind.describe("PWSH_HISTORY_BIND")
+        "  lazy install: {}",
+        if config.lazy { "enabled" } else { "disabled" }
     );
-    println!(
-        "PWSH_HISTORY_URL={} ({})",
-        config.url,
-        config.sources.url.describe("PWSH_HISTORY_URL")
-    );
-    if config.lazy {
-        println!("PWSH_HISTORY_LAZY=1");
-    }
 }
 
 impl ConfigSource {
     fn describe(self, name: &str) -> String {
         match self {
-            ConfigSource::Env => format!("from env {name}"),
+            ConfigSource::Arg => format!("from {name}"),
             ConfigSource::Profile => "from profile $PROFILE.CurrentUserAllHosts".to_string(),
             ConfigSource::Default => "program default".to_string(),
             ConfigSource::Generated => "generated new random value".to_string(),
@@ -416,13 +415,15 @@ fn print_help() {
 pwsh-history-server
 
 Usage:
-  pwsh-history-server [--lazy]
+  pwsh-history-server [--db PATH] [--port PORT] [--token TOKEN] [--lazy]
 
-Environment overrides:
-  PWSH_HISTORY_DB       default: $HOME/.local/share/pwsh-history/history.sqlite3
-  PWSH_HISTORY_TOKEN    default: random 32-byte hex token printed at startup
-  PWSH_HISTORY_BIND     default: {DEFAULT_BIND}
-  PWSH_HISTORY_URL      default: default-route IP derived from bind port
+Server options:
+  --db PATH             SQLite database path
+                        default: $HOME/.local/share/pwsh-history/history.sqlite3
+  --port PORT           listen on 0.0.0.0:PORT
+                        default: {DEFAULT_PORT}
+  --token TOKEN         HTTP API token
+                        default: profile token, otherwise generated
 
 Options:
   --lazy                install pwsh-history.ps1 and update $PROFILE.CurrentUserAllHosts
@@ -581,10 +582,6 @@ fn managed_profile_block(config: &Config, script_path: &Path, include_source: bo
     let mut block = String::new();
     block.push_str(PROFILE_BEGIN);
     block.push('\n');
-    block.push_str(&format!(
-        "$env:PWSH_HISTORY_DB = {}\n",
-        ps_path_expr(Path::new(&config.db_path))
-    ));
     block.push_str(&format!(
         "$env:PWSH_HISTORY_TOKEN = '{}'\n",
         ps_single_quote(&config.token)
@@ -853,8 +850,8 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ConfigSource, ConfigSources, DEFAULT_BIND, escape_like, managed_profile_block,
-        parse_profile_config, ps_path_expr_with_home, update_profile_content,
+        Config, ConfigSource, ConfigSources, DEFAULT_PORT, escape_like, managed_profile_block,
+        parse_args, parse_profile_config, ps_path_expr_with_home, update_profile_content,
     };
     use std::{net::SocketAddr, path::Path};
 
@@ -864,8 +861,8 @@ mod tests {
     }
 
     #[test]
-    fn default_bind_is_all_interfaces() {
-        assert_eq!(DEFAULT_BIND, "0.0.0.0:37373");
+    fn default_port_is_37373() {
+        assert_eq!(DEFAULT_PORT, 37373);
     }
 
     #[test]
@@ -882,7 +879,7 @@ mod tests {
             .unwrap();
 
         assert!(token_index < source_index);
-        assert!(block.contains("$env:PWSH_HISTORY_DB = '/tmp/env.sqlite3'"));
+        assert!(!block.contains("PWSH_HISTORY_DB"));
         assert!(block.contains("$env:PWSH_HISTORY_TOKEN = 'env-token'"));
         assert!(!block.contains("PWSH_HISTORY_BIND"));
         assert!(block.contains("$env:PWSH_HISTORY_URL = 'http://history-host:9999'"));
@@ -904,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_config_reads_existing_managed_values() {
+    fn profile_config_reads_only_existing_token() {
         let profile = "\
 # >>> pwsh-history-server >>>
 $env:PWSH_HISTORY_DB = (Join-Path $HOME '.local/share/pwsh-history/history.sqlite3')
@@ -912,27 +909,38 @@ $env:PWSH_HISTORY_TOKEN = 'keep-this-token'
 $env:PWSH_HISTORY_URL = 'http://10.0.0.2:37373'
 # <<< pwsh-history-server <<<
 ";
-        let config = parse_profile_config(profile, Some(Path::new("/home/me")));
+        let config = parse_profile_config(profile);
 
-        assert_eq!(
-            config.db_path.as_deref(),
-            Some("/home/me/.local/share/pwsh-history/history.sqlite3")
-        );
         assert_eq!(config.token.as_deref(), Some("keep-this-token"));
-        assert_eq!(config.url.as_deref(), Some("http://10.0.0.2:37373"));
-        assert_eq!(config.bind, None);
     }
 
     #[test]
-    fn profile_config_reads_legacy_bind_and_escaped_quotes() {
+    fn profile_config_reads_escaped_token_and_ignores_other_fields() {
         let profile = "\
 $env:PWSH_HISTORY_TOKEN = 'it''s-token'
 $env:PWSH_HISTORY_BIND = '0.0.0.0:38444'
 ";
-        let config = parse_profile_config(profile, Some(Path::new("/home/me")));
+        let config = parse_profile_config(profile);
 
         assert_eq!(config.token.as_deref(), Some("it's-token"));
-        assert_eq!(config.bind.as_deref(), Some("0.0.0.0:38444"));
+    }
+
+    #[test]
+    fn parse_args_accepts_server_options() {
+        let args = parse_args([
+            "--db".to_string(),
+            "/tmp/history.sqlite3".to_string(),
+            "--port=38444".to_string(),
+            "--token".to_string(),
+            "token".to_string(),
+            "--lazy".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(args.db_path.as_deref(), Some("/tmp/history.sqlite3"));
+        assert_eq!(args.port, Some(38444));
+        assert_eq!(args.token.as_deref(), Some("token"));
+        assert!(args.lazy);
     }
 
     #[test]
@@ -1054,15 +1062,14 @@ after
         Config {
             db_path: "/tmp/env.sqlite3".to_string(),
             token: "env-token".to_string(),
-            bind: "1.2.3.4:9999".to_string(),
-            addr: "1.2.3.4:9999".parse::<SocketAddr>().unwrap(),
+            port: 9999,
+            addr: "0.0.0.0:9999".parse::<SocketAddr>().unwrap(),
             url: "http://history-host:9999".to_string(),
             lazy: true,
             sources: ConfigSources {
-                db_path: ConfigSource::Env,
-                token: ConfigSource::Env,
-                bind: ConfigSource::Env,
-                url: ConfigSource::Env,
+                db_path: ConfigSource::Arg,
+                token: ConfigSource::Arg,
+                port: ConfigSource::Arg,
             },
         }
     }

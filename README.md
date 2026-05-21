@@ -13,37 +13,38 @@ cargo build --release
 ./target/release/pwsh-history-server
 ```
 
-Without environment variables, the server uses:
+With no options, the server uses:
 
 ```text
-PWSH_HISTORY_DB=$HOME/.local/share/pwsh-history/history.sqlite3
-PWSH_HISTORY_TOKEN=<random 32-byte hex token printed at startup>
-PWSH_HISTORY_BIND=0.0.0.0:37373
-PWSH_HISTORY_URL=http://<default-route-ip>:37373
+db=$HOME/.local/share/pwsh-history/history.sqlite3
+port=37373
+bind=0.0.0.0:37373
+token=<token from PowerShell profile, otherwise random 32-byte hex token printed at startup>
+client url=http://<default-route-ip>:37373
 ```
 
 The server creates the SQLite parent directory automatically and enables WAL mode.
 
 ## Configuration
 
-Environment variables override the defaults:
+Server configuration is command-line only:
 
 ```sh
-export PWSH_HISTORY_DB="$HOME/.local/share/pwsh-history/history.sqlite3"
-export PWSH_HISTORY_TOKEN="change-this-long-random-token"
-export PWSH_HISTORY_BIND="0.0.0.0:37373"
-export PWSH_HISTORY_URL="http://history-server-host:37373"
+./target/release/pwsh-history-server \
+  --db "$HOME/.local/share/pwsh-history/history.sqlite3" \
+  --port 37373 \
+  --token "change-this-long-random-token"
 ```
 
-`PWSH_HISTORY_URL` is used by the PowerShell client. If it is not set and the bind address is `0.0.0.0` or `[::]`, the server detects the default-route IP and uses that address when `--lazy` writes the profile.
+The server does not read `PWSH_HISTORY_*` environment variables. Those variables are only for the PowerShell client.
 
-Configuration is resolved per setting in this order:
+`--port` always binds `0.0.0.0:<port>`. The bind address is not configurable.
+
+The token is resolved in this order:
 
 ```text
-environment variable > existing PowerShell profile value > program default
+--token > existing PWSH_HISTORY_TOKEN in $PROFILE.CurrentUserAllHosts > generated random token
 ```
-
-That means repeated `--lazy` runs reuse the token already written to `$PROFILE.CurrentUserAllHosts` unless `PWSH_HISTORY_TOKEN` is explicitly set in the server process environment.
 
 ## Lazy PowerShell setup
 
@@ -59,7 +60,7 @@ This copies `pwsh-history.ps1` to:
 $HOME/.config/powershell/pwsh-history.ps1
 ```
 
-Then it updates `$PROFILE.CurrentUserAllHosts` with a managed block containing the effective client settings before sourcing `pwsh-history.ps1`. The block writes `PWSH_HISTORY_DB`, `PWSH_HISTORY_TOKEN`, and `PWSH_HISTORY_URL`; it does not write server-only settings such as `PWSH_HISTORY_BIND`. Paths under the home directory are written through `$HOME` instead of hard-coded absolute home paths. If the managed block already exists, it is replaced.
+Then it updates `$PROFILE.CurrentUserAllHosts` with a managed block containing the effective client settings before sourcing `pwsh-history.ps1`. The block writes only `PWSH_HISTORY_TOKEN` and `PWSH_HISTORY_URL`. It does not write server-only settings such as the DB path or bind address. If the managed block already exists, only that marked range is replaced; content and whitespace before and after it are preserved exactly.
 
 ## HTTP API
 
@@ -145,10 +146,7 @@ Example:
 Description=PowerShell history server
 
 [Service]
-Environment=PWSH_HISTORY_DB=%h/.local/share/pwsh-history/history.sqlite3
-Environment=PWSH_HISTORY_TOKEN=change-this-long-random-token
-Environment=PWSH_HISTORY_BIND=0.0.0.0:37373
-ExecStart=/path/to/pwsh-history-server
+ExecStart=/path/to/pwsh-history-server --db %h/.local/share/pwsh-history/history.sqlite3 --port 37373 --token change-this-long-random-token
 Restart=on-failure
 
 [Install]
