@@ -266,7 +266,7 @@ fn resolve_config_value<T>(
 }
 
 fn load_profile_config() -> ProfileConfig {
-    let profile_path = current_user_all_hosts_profile()
+    let profile_path = current_user_current_host_profile()
         .map(PathBuf::from)
         .or_else(|| {
             home_dir()
@@ -406,7 +406,7 @@ impl ConfigSource {
     fn describe(self, name: &str) -> String {
         match self {
             ConfigSource::Arg => format!("from {name}"),
-            ConfigSource::Profile => "from profile $PROFILE.CurrentUserAllHosts".to_string(),
+            ConfigSource::Profile => "from profile $PROFILE.CurrentUserCurrentHost".to_string(),
             ConfigSource::Default => "program default".to_string(),
             ConfigSource::Generated => "generated new random value".to_string(),
         }
@@ -430,7 +430,7 @@ Server options:
                         default: profile token, otherwise generated
 
 Options:
-  --install             install pwsh-history.ps1 and update $PROFILE.CurrentUserAllHosts
+  --install             install pwsh-history.ps1 and update $PROFILE.CurrentUserCurrentHost
   -h, --help            show this help
 "
     );
@@ -449,7 +449,7 @@ fn install_lazy_profile(config: &Config) -> Result<()> {
     write_file(&script_path, PWSH_HISTORY_SCRIPT)
         .with_context(|| format!("failed to write {}", script_path.display()))?;
 
-    let profile_path = current_user_all_hosts_profile().unwrap_or_else(|| {
+    let profile_path = current_user_current_host_profile().unwrap_or_else(|| {
         powershell_dir
             .join("profile.ps1")
             .to_string_lossy()
@@ -492,13 +492,13 @@ fn write_file(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-fn current_user_all_hosts_profile() -> Option<String> {
+fn current_user_current_host_profile() -> Option<String> {
     let output = Command::new("pwsh")
         .args([
             "-NoLogo",
             "-NoProfile",
             "-Command",
-            "$PROFILE.CurrentUserAllHosts",
+            "$PROFILE.CurrentUserCurrentHost",
         ])
         .output()
         .ok()?;

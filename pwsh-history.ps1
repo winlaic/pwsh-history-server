@@ -337,13 +337,6 @@ function Invoke-PwshHistoryPrefixSearch {
     Set-PwshHistoryBuffer -Line $matches[$index]
 }
 
-Set-PSReadLineOption -EditMode Emacs
-Set-PSReadLineOption -HistorySearchCursorMovesToEnd
-Set-PSReadLineOption -MaximumHistoryCount 100000
-Set-PSReadLineOption -HistoryNoDuplicates
-Set-PSReadLineKeyHandler -Chord Tab -Function MenuComplete
-Set-PSReadLineOption -BellStyle None
-
 try {
     Set-PSReadLineOption -HistorySaveStyle SaveNothing
 } catch {

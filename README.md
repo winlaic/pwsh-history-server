@@ -43,7 +43,7 @@ The server does not read `PWSH_HISTORY_*` environment variables. Those variables
 The token is resolved in this order:
 
 ```text
---token > existing PWSH_HISTORY_TOKEN in $PROFILE.CurrentUserAllHosts > generated random token
+--token > existing PWSH_HISTORY_TOKEN in $PROFILE.CurrentUserCurrentHost > generated random token
 ```
 
 ## Lazy PowerShell setup
@@ -60,7 +60,7 @@ This copies `pwsh-history.ps1` to:
 $HOME/.config/powershell/pwsh-history.ps1
 ```
 
-Then it updates `$PROFILE.CurrentUserAllHosts` with a managed block containing the effective client settings before sourcing `pwsh-history.ps1`. The block writes only `PWSH_HISTORY_TOKEN` and `PWSH_HISTORY_URL`. It does not write server-only settings such as the DB path or bind address. If the managed block already exists, only that marked range is replaced; content and whitespace before and after it are preserved exactly.
+Then it updates `$PROFILE.CurrentUserCurrentHost` with a managed block containing the effective client settings before sourcing `pwsh-history.ps1`. The block writes only `PWSH_HISTORY_TOKEN` and `PWSH_HISTORY_URL`. It does not write server-only settings such as the DB path or bind address. If the managed block already exists, only that marked range is replaced; content and whitespace before and after it are preserved exactly.
 
 ## HTTP API
 
