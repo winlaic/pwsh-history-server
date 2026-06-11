@@ -77,18 +77,21 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 struct AddHistoryRequest {
     command: String,
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SearchQuery {
     prefix: String,
     limit: Option<i64>,
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
 struct HistoryEntry {
     id: i64,
     command: String,
+    cwd: String,
     last_seen_at: i64,
     use_count: i64,
 }
@@ -646,16 +649,33 @@ async fn migrate(db: &SqlitePool) -> Result<()> {
         r#"
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            command TEXT NOT NULL UNIQUE,
+            command TEXT NOT NULL,
+            cwd TEXT NOT NULL DEFAULT '',
             first_seen_at INTEGER NOT NULL,
             last_seen_at INTEGER NOT NULL,
-            use_count INTEGER NOT NULL DEFAULT 1
+            use_count INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(command, cwd)
         );
         "#,
     )
     .execute(db)
     .await
     .context("failed to create history table")?;
+
+    if let Err(error) = sqlx::query(
+        r#"
+        ALTER TABLE history ADD COLUMN cwd TEXT NOT NULL DEFAULT '';
+        "#,
+    )
+    .execute(db)
+    .await
+    {
+        if !is_duplicate_column_error(&error) {
+            return Err(error).context("failed to add cwd column");
+        }
+    }
+
+    migrate_history_unique_key(db).await?;
 
     sqlx::query(
         r#"
@@ -677,7 +697,91 @@ async fn migrate(db: &SqlitePool) -> Result<()> {
     .await
     .context("failed to create last_seen index")?;
 
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_history_cwd_last_seen
+        ON history(cwd, last_seen_at DESC, id DESC);
+        "#,
+    )
+    .execute(db)
+    .await
+    .context("failed to create cwd last_seen index")?;
+
     Ok(())
+}
+
+async fn migrate_history_unique_key(db: &SqlitePool) -> Result<()> {
+    let table_sql: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'table' AND name = 'history'
+        "#,
+    )
+    .fetch_optional(db)
+    .await
+    .context("failed to inspect history table")?;
+
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+
+    if !table_sql.contains("command TEXT NOT NULL UNIQUE") {
+        return Ok(());
+    }
+
+    let mut tx = db
+        .begin()
+        .await
+        .context("failed to start history migration")?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE history_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            command TEXT NOT NULL,
+            cwd TEXT NOT NULL DEFAULT '',
+            first_seen_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            use_count INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(command, cwd)
+        );
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .context("failed to create migrated history table")?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO history_new(id, command, cwd, first_seen_at, last_seen_at, use_count)
+        SELECT id, command, COALESCE(cwd, ''), first_seen_at, last_seen_at, use_count
+        FROM history;
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .context("failed to copy history rows")?;
+
+    sqlx::query("DROP TABLE history;")
+        .execute(&mut *tx)
+        .await
+        .context("failed to drop old history table")?;
+
+    sqlx::query("ALTER TABLE history_new RENAME TO history;")
+        .execute(&mut *tx)
+        .await
+        .context("failed to rename migrated history table")?;
+
+    tx.commit()
+        .await
+        .context("failed to commit history migration")?;
+
+    Ok(())
+}
+
+fn is_duplicate_column_error(error: &sqlx::Error) -> bool {
+    error.to_string().contains("duplicate column name")
 }
 
 async fn healthz() -> &'static str {
@@ -691,23 +795,30 @@ async fn add_history(
 ) -> Result<impl IntoResponse, ApiError> {
     require_auth(&headers, &state)?;
 
-    let command = parse_add_body(&headers, body)?;
-    let command = command.trim();
+    let request = parse_add_body(&headers, body)?;
+    let command = request.command.trim();
     if command.is_empty() {
         return Err(ApiError::bad_request("command is empty"));
     }
+    let cwd = request
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
 
     let now = now_millis()?;
     let result = sqlx::query(
         r#"
-        INSERT INTO history(command, first_seen_at, last_seen_at, use_count)
-        VALUES (?1, ?2, ?2, 1)
-        ON CONFLICT(command) DO UPDATE SET
+        INSERT INTO history(command, cwd, first_seen_at, last_seen_at, use_count)
+        VALUES (?1, ?2, ?3, ?3, 1)
+        ON CONFLICT(command, cwd) DO UPDATE SET
             last_seen_at = excluded.last_seen_at,
             use_count = history.use_count + 1
         "#,
     )
     .bind(command)
+    .bind(cwd)
     .bind(now)
     .execute(&state.db)
     .await
@@ -715,6 +826,7 @@ async fn add_history(
 
     info!(
         command_len = command.len(),
+        cwd,
         rows_affected = result.rows_affected(),
         "history add"
     );
@@ -731,24 +843,58 @@ async fn search_history(
 
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let pattern = format!("{}%", escape_like(&query.prefix));
+    let cwd = query
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
-    let entries = sqlx::query_as::<_, HistoryEntry>(
-        r#"
-        SELECT id, command, last_seen_at, use_count
-        FROM history
-        WHERE command LIKE ?1 ESCAPE '\'
-        ORDER BY last_seen_at DESC, id DESC
-        LIMIT ?2
-        "#,
-    )
-    .bind(pattern)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await
-    .map_err(ApiError::internal)?;
+    let entries = if let Some(cwd) = cwd {
+        sqlx::query_as::<_, HistoryEntry>(
+            r#"
+            SELECT id, command, cwd, last_seen_at, use_count
+            FROM history
+            WHERE command LIKE ?1 ESCAPE '\' AND cwd = ?2
+            ORDER BY last_seen_at DESC, id DESC
+            LIMIT ?3
+            "#,
+        )
+        .bind(&pattern)
+        .bind(cwd)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await
+        .map_err(ApiError::internal)?
+    } else {
+        sqlx::query_as::<_, HistoryEntry>(
+            r#"
+            SELECT id, command, cwd, last_seen_at, use_count
+            FROM (
+                SELECT
+                    id,
+                    command,
+                    cwd,
+                    last_seen_at,
+                    use_count,
+                    ROW_NUMBER() OVER (PARTITION BY command ORDER BY last_seen_at DESC, id DESC) AS command_rank
+                FROM history
+                WHERE command LIKE ?1 ESCAPE '\'
+            )
+            WHERE command_rank = 1
+            ORDER BY last_seen_at DESC, id DESC
+            LIMIT ?2
+            "#,
+        )
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await
+        .map_err(ApiError::internal)?
+    };
 
     info!(
         prefix = %query.prefix,
+        cwd = cwd.unwrap_or(""),
         limit,
         hits = entries.len(),
         "history search"
@@ -757,7 +903,7 @@ async fn search_history(
     Ok((StatusCode::OK, Json(SearchResponse { entries })))
 }
 
-fn parse_add_body(headers: &HeaderMap, body: Bytes) -> Result<String, ApiError> {
+fn parse_add_body(headers: &HeaderMap, body: Bytes) -> Result<AddHistoryRequest, ApiError> {
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -766,11 +912,13 @@ fn parse_add_body(headers: &HeaderMap, body: Bytes) -> Result<String, ApiError> 
     if content_type.starts_with("application/json") {
         let request: AddHistoryRequest = serde_json::from_slice(&body)
             .map_err(|error| ApiError::bad_request(format!("invalid json body: {error}")))?;
-        return Ok(request.command);
+        return Ok(request);
     }
 
-    String::from_utf8(body.to_vec())
-        .map_err(|error| ApiError::bad_request(format!("request body is not utf-8: {error}")))
+    let command = String::from_utf8(body.to_vec())
+        .map_err(|error| ApiError::bad_request(format!("request body is not utf-8: {error}")))?;
+
+    Ok(AddHistoryRequest { command, cwd: None })
 }
 
 fn require_auth(headers: &HeaderMap, state: &AppState) -> Result<(), ApiError> {

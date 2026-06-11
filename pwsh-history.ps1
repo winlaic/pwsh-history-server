@@ -39,7 +39,7 @@ if (-not [string]::IsNullOrWhiteSpace($script:PwshHistoryToken)) {
     $script:PwshHistoryClient.DefaultRequestHeaders.TryAddWithoutValidation('X-Pwsh-History-Token', $script:PwshHistoryToken) | Out-Null
 }
 
-$script:PwshHistorySearchState = @{ Prefix = $null; Matches = @(); Index = -1 }
+$script:PwshHistorySearchState = @{ Prefix = $null; Matches = @(); Index = -1; CurrentDirectory = $null; Scope = 'Directory' }
 
 # ==========================================
 # 2. 原生回退与本地内存替换逻辑
@@ -74,14 +74,62 @@ function Reset-PwshHistorySearchState {
     $script:PwshHistorySearchState['Prefix'] = $null
     $script:PwshHistorySearchState['Matches'] = @()
     $script:PwshHistorySearchState['Index'] = -1
+    $script:PwshHistorySearchState['CurrentDirectory'] = $null
+    $script:PwshHistorySearchState['Scope'] = 'Directory'
+}
+
+function Get-PwshHistoryResolvedCurrentDirectory {
+    try {
+        $path = (Get-Location -ErrorAction Stop).ProviderPath
+        if ([string]::IsNullOrWhiteSpace($path)) { return $null }
+
+        if (-not $IsWindows) {
+            $realpath = Get-Command realpath -ErrorAction SilentlyContinue
+            if ($null -ne $realpath) {
+                $resolved = & $realpath.Source -- $path 2>$null
+                if (-not [string]::IsNullOrWhiteSpace($resolved)) { return [string]$resolved }
+            }
+        }
+
+        return Resolve-PwshHistoryDirectoryPath -Path $path
+    } catch { }
+
+    return $null
+}
+
+function Resolve-PwshHistoryDirectoryPath {
+    param([string]$Path)
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrWhiteSpace($root)) { return $fullPath }
+
+    $remaining = $fullPath.Substring($root.Length).Trim([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $resolvedPath = $root.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    if ([string]::IsNullOrEmpty($resolvedPath)) { $resolvedPath = $root }
+
+    foreach ($segment in $remaining -split '[\\/]') {
+        if ([string]::IsNullOrWhiteSpace($segment)) { continue }
+        $candidatePath = [System.IO.Path]::Combine($resolvedPath, $segment)
+        $candidate = [System.IO.DirectoryInfo]::new($candidatePath)
+        $target = $candidate.ResolveLinkTarget($true)
+        if ($null -ne $target) { $resolvedPath = $target.FullName }
+        else { $resolvedPath = $candidate.FullName }
+    }
+
+    return $resolvedPath
 }
 
 function Search-PwshHistoryServer {
-    param([string]$Prefix = '', [int]$Limit = 100)
+    param([string]$Prefix = '', [int]$Limit = 100, [string]$CurrentDirectory)
     if ([string]::IsNullOrWhiteSpace($script:PwshHistoryToken)) { return @() }
     try {
         $encodedPrefix = [uri]::EscapeDataString($Prefix)
         $uri = "$script:PwshHistoryServerUrl/v1/history/search?prefix=$encodedPrefix&limit=$Limit"
+        if (-not [string]::IsNullOrWhiteSpace($CurrentDirectory)) {
+            $encodedCurrentDirectory = [uri]::EscapeDataString($CurrentDirectory)
+            $uri = "$uri&cwd=$encodedCurrentDirectory"
+        }
         $json = $script:PwshHistoryClient.GetStringAsync($uri).GetAwaiter().GetResult()
         $doc = [System.Text.Json.JsonDocument]::Parse($json)
         try {
@@ -98,7 +146,10 @@ function Add-PwshHistoryServer {
     param([string]$Command)
     if ([string]::IsNullOrWhiteSpace($script:PwshHistoryToken) -or [string]::IsNullOrWhiteSpace($Command)) { return }
     try {
-        $body = @{ command = $Command } | ConvertTo-Json -Compress
+        $bodyData = @{ command = $Command }
+        $currentDirectory = Get-PwshHistoryResolvedCurrentDirectory
+        if (-not [string]::IsNullOrWhiteSpace($currentDirectory)) { $bodyData['cwd'] = $currentDirectory }
+        $body = $bodyData | ConvertTo-Json -Compress
         $content = [System.Net.Http.StringContent]::new($body, [System.Text.Encoding]::UTF8, "application/json")
         $null = $script:PwshHistoryClient.PostAsync("$script:PwshHistoryServerUrl/v1/history/add", $content)
     } catch { }
@@ -112,7 +163,7 @@ function Register-PwshHistoryPredictor {
 
     $dllDir = Split-Path $PROFILE
     if (-not (Test-Path $dllDir)) { New-Item -ItemType Directory -Path $dllDir -Force | Out-Null }
-    $dllPath = Join-Path $dllDir "PwshHistoryPredictor.dll"
+    $dllPath = Join-Path $dllDir "PwshHistoryPredictor.v2.dll"
 
     # 【智能编译】：如果没有找到 DLL，说明是初次运行或者用户主动删除了它
     if (-not (Test-Path $dllPath)) {
@@ -161,8 +212,12 @@ public sealed class PwshHistoryServerPredictor : ICommandPredictor
             int lastNewline = input.LastIndexOf('\n');
             if (lastNewline >= 0) { input = input.Substring(lastNewline + 1); }
 
-            // 动态拼接 limit
             string uri = baseUrl + "/v1/history/search?prefix=" + Uri.EscapeDataString(input) + "&limit=" + this.limit;
+            string currentDirectory = ResolveCurrentDirectory();
+            if (!string.IsNullOrWhiteSpace(currentDirectory))
+            {
+                uri += "&cwd=" + Uri.EscapeDataString(currentDirectory);
+            }
             using (var request = new HttpRequestMessage(HttpMethod.Get, uri))
             {
                 request.Headers.TryAddWithoutValidation("X-Pwsh-History-Token", token);
@@ -200,6 +255,66 @@ public sealed class PwshHistoryServerPredictor : ICommandPredictor
         }
         catch { }
         return new SuggestionPackage(suggestions);
+    }
+
+    private static string ResolveCurrentDirectory()
+    {
+        try
+        {
+            string path = Environment.CurrentDirectory;
+            if (string.IsNullOrWhiteSpace(path)) return null;
+
+            if (!Environment.OSVersion.Platform.ToString().StartsWith("Win", StringComparison.OrdinalIgnoreCase))
+            {
+                string realpath = RunRealpath(path);
+                if (!string.IsNullOrWhiteSpace(realpath)) return realpath;
+            }
+
+            return ResolveDirectoryPath(path);
+        }
+        catch { return null; }
+    }
+
+    private static string RunRealpath(string path)
+    {
+        try
+        {
+            using (var process = new System.Diagnostics.Process())
+            {
+                process.StartInfo.FileName = "realpath";
+                process.StartInfo.ArgumentList.Add("--");
+                process.StartInfo.ArgumentList.Add(path);
+                process.StartInfo.RedirectStandardOutput = true;
+                process.StartInfo.RedirectStandardError = true;
+                process.StartInfo.UseShellExecute = false;
+                if (!process.Start()) return null;
+                string output = process.StandardOutput.ReadToEnd().Trim();
+                if (!process.WaitForExit(100) || process.ExitCode != 0) return null;
+                return output;
+            }
+        }
+        catch { return null; }
+    }
+
+    private static string ResolveDirectoryPath(string path)
+    {
+        string fullPath = System.IO.Path.GetFullPath(path);
+        string root = System.IO.Path.GetPathRoot(fullPath);
+        if (string.IsNullOrWhiteSpace(root)) return fullPath;
+
+        string remaining = fullPath.Substring(root.Length).Trim(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
+        string resolvedPath = root.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
+        if (string.IsNullOrEmpty(resolvedPath)) resolvedPath = root;
+
+        foreach (string segment in remaining.Split(new[] { System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            string candidatePath = System.IO.Path.Combine(resolvedPath, segment);
+            var candidate = new System.IO.DirectoryInfo(candidatePath);
+            System.IO.FileSystemInfo target = candidate.ResolveLinkTarget(true);
+            resolvedPath = target == null ? candidate.FullName : target.FullName;
+        }
+
+        return resolvedPath;
     }
 
     public bool CanAcceptFeedback(PredictionClient client, PredictorFeedbackKind feedback) { return false; }
@@ -248,11 +363,14 @@ public sealed class PwshHistoryServerPredictor : ICommandPredictor
 # 4. 按键绑定
 # ==========================================
 function Invoke-PwshHistoryPrefixSearch {
-    param([string]$Direction, $Key, $Arg)
+    param([string]$Direction, $Key, $Arg, [switch]$Global)
     $buffer = Get-PwshHistoryBuffer
     $matches = @($script:PwshHistorySearchState['Matches'])
     $index = [int]$script:PwshHistorySearchState['Index']
-    $isCurrentServerMatch = $index -ge 0 -and $index -lt $matches.Count -and $buffer.Line -eq $matches[$index]
+    $currentDirectory = if ($Global) { $null } else { Get-PwshHistoryResolvedCurrentDirectory }
+    $scope = if ($Global) { 'Global' } else { 'Directory' }
+    $isSameScope = [string]$script:PwshHistorySearchState['Scope'] -eq $scope -and [string]$script:PwshHistorySearchState['CurrentDirectory'] -eq [string]$currentDirectory
+    $isCurrentServerMatch = $isSameScope -and $index -ge 0 -and $index -lt $matches.Count -and $buffer.Line -eq $matches[$index]
 
     if (-not $isCurrentServerMatch) {
         if ($Direction -eq 'Forward') {
@@ -262,7 +380,7 @@ function Invoke-PwshHistoryPrefixSearch {
         }
 
         $prefix = $buffer.Line.Substring(0, $buffer.Cursor)
-        $matches = @(Search-PwshHistoryServer -Prefix $prefix -Limit 100)
+        $matches = @(Search-PwshHistoryServer -Prefix $prefix -Limit 100 -CurrentDirectory $currentDirectory)
 
         if ($matches.Count -eq 0) {
             Reset-PwshHistorySearchState
@@ -273,6 +391,8 @@ function Invoke-PwshHistoryPrefixSearch {
         $script:PwshHistorySearchState['Prefix'] = $prefix
         $script:PwshHistorySearchState['Matches'] = $matches
         $script:PwshHistorySearchState['Index'] = 0
+        $script:PwshHistorySearchState['CurrentDirectory'] = $currentDirectory
+        $script:PwshHistorySearchState['Scope'] = $scope
         Set-PwshHistoryBuffer -Line $matches[0]
         return
     }
@@ -310,4 +430,24 @@ Set-PSReadLineKeyHandler -Chord UpArrow -ScriptBlock {
 Set-PSReadLineKeyHandler -Chord DownArrow -ScriptBlock {
     param($key, $arg)
     Invoke-PwshHistoryPrefixSearch -Direction Forward -Key $key -Arg $arg
+}
+
+Set-PSReadLineKeyHandler -Chord Ctrl+p -ScriptBlock {
+    param($key, $arg)
+    Invoke-PwshHistoryPrefixSearch -Direction Backward -Key $key -Arg $arg
+}
+
+Set-PSReadLineKeyHandler -Chord Ctrl+n -ScriptBlock {
+    param($key, $arg)
+    Invoke-PwshHistoryPrefixSearch -Direction Forward -Key $key -Arg $arg
+}
+
+Set-PSReadLineKeyHandler -Chord Shift+UpArrow -ScriptBlock {
+    param($key, $arg)
+    Invoke-PwshHistoryPrefixSearch -Direction Backward -Key $key -Arg $arg -Global
+}
+
+Set-PSReadLineKeyHandler -Chord Shift+DownArrow -ScriptBlock {
+    param($key, $arg)
+    Invoke-PwshHistoryPrefixSearch -Direction Forward -Key $key -Arg $arg -Global
 }

@@ -82,13 +82,22 @@ Add a command:
 curl -X POST http://127.0.0.1:37373/v1/history/add \
   -H "X-Pwsh-History-Token: $PWSH_HISTORY_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"command":"git status"}'
+  -d '{"command":"git status","cwd":"/absolute/resolved/project/path"}'
 ```
+
+`cwd` is optional for backward compatibility. The PowerShell client sends the current provider path as a stable absolute directory and resolves symlinks before storing it.
 
 Search by prefix:
 
 ```sh
 curl "http://127.0.0.1:37373/v1/history/search?prefix=git&limit=100" \
+  -H "X-Pwsh-History-Token: $PWSH_HISTORY_TOKEN"
+```
+
+Directory-scoped search by prefix:
+
+```sh
+curl "http://127.0.0.1:37373/v1/history/search?prefix=git&limit=100&cwd=/absolute/resolved/project/path" \
   -H "X-Pwsh-History-Token: $PWSH_HISTORY_TOKEN"
 ```
 
@@ -100,6 +109,7 @@ Response:
     {
       "id": 1,
       "command": "git status",
+      "cwd": "/absolute/resolved/project/path",
       "last_seen_at": 1779330000000,
       "use_count": 1
     }
@@ -126,7 +136,10 @@ The script configures these PSReadLine behaviors:
 
 - `UpArrow` searches server history backward by the current prefix.
 - `DownArrow` moves forward through the server search results and then restores the typed prefix.
-- Inline prediction uses the history server as a PSReadLine predictor, so the gray suggestion text can be accepted with `RightArrow`.
+- `Ctrl+p` and `Ctrl+n` use the same server history search as `UpArrow` and `DownArrow`, which keeps Emacs key bindings working.
+- `UpArrow`/`DownArrow`/`Ctrl+p`/`Ctrl+n` search only commands last run from the current resolved directory.
+- `Shift+UpArrow` and `Shift+DownArrow` search global server history without filtering by directory.
+- Inline prediction uses the current resolved directory when searching the history server, so the gray suggestion text can be accepted with `RightArrow`.
 - `AddToHistoryHandler` sends accepted commands to the server.
 - PSReadLine file saving is set to `SaveNothing` to avoid the shared-home history-file race.
 - If the server is down or the token is missing, add failures are ignored and arrow search falls back to PSReadLine local history.
